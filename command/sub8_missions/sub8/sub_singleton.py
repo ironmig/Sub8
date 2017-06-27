@@ -10,6 +10,7 @@ from sub8 import pose_editor
 import mil_ros_tools
 from sub8_msgs.srv import VisionRequest, VisionRequestRequest, VisionRequest2DRequest, VisionRequest2D
 from mil_msgs.srv import SetGeometry, SetGeometryRequest
+import mil_passive_sonar.srv as sonar_srvs
 from std_srvs.srv import SetBool, SetBoolRequest
 from nav_msgs.msg import Odometry
 from tf.transformations import quaternion_multiply, quaternion_from_euler
@@ -161,6 +162,34 @@ class _PoseProxy(object):
         return traj
 
 
+class _PassiveSonarProxy(object):
+    '''
+    Wrapper for communicating with mil_passive_sonar driver
+
+    Example usage:
+    yield sub.passive_sonar.set_frequency(13000)
+    position = yield sub.passive_sonar.estimate_position()
+    '''
+    def __init__(self, nh, namespace='hydrophones'):
+        self._set_frequency = nh.get_service_client(namespace + "/set_freq", sonar_srvs.SetFrequency)
+        self._get_heading = nh.get_service_client(namespace + '/get_pulse_heading', sonar_srvs.GetPulseHeading)
+        self._estimate_position = nh.get_service_client(namespace + '/estimate_pinger_position',
+                                                        sonar_srvs.EstimatePingerPosition)
+        self._reset = nh.get_service_client(namespace + "/reset_position_estimate", sonar_srvs.ResetPositionEstimate)
+
+    def set_frequency(self, freq):
+        return self._set_frequency(sonar_srvs.SetFrequencyRequest(freq))
+
+    def reset(self):
+        return self._reset(sonar_srvs.ResetPositionEstimateRequest())
+
+    def estimate_position(self):
+        return self._estimate_position(sonar_srvs.EstimatePingerPositionRequest())
+
+    def get_heading(self):
+        return self._get_heading(sonar_srvs.GetPulseHeadingRequest())
+
+
 class _Sub(object):
     def __init__(self, node_handle):
         self.nh = node_handle
@@ -176,6 +205,7 @@ class _Sub(object):
         self._tf_listener = yield tf.TransformListener(self.nh)
 
         self.vision_proxies = _VisionProxies(self.nh, 'vision_proxies.yaml')
+        self.passive_sonar = _PassiveSonarProxy(self.nh)
 
         defer.returnValue(self)
 
