@@ -1,62 +1,73 @@
+from __future__ import division
+import tf
+import numpy as np
+from twisted.internet import defer
 from txros import util
-import rospy
-from sub8_msgs.srv import TBDetectionSwitch
-# from sub8_perception.srv import TBDetectionSwitch
-from geometry_msgs.msg import Pose
+from sub8 import Searcher
 from mil_ros_tools import rosmsg_to_numpy
+from mil_misc_tools import text_effects
+from mil_vision_tools import RectFinder
 
-
-@util.cancellableInlineCallbacks
-def align_to_board(msg, sub):
-    position = rosmsg_to_numpy(msg.position)
-    yield sub.move.set_position(position).zero_roll_and_pitch().go()
-
+SEARCH_DEPTH = .65
+SEARCH_RADIUS_METERS = 1.0
+TIMEOUT_SECONDS = 60
+DO_PATTERN = True
+FACE_FORWARD = True
+SPEED = 0.5
+MISSION = "TORPEDO"
+forward_vec = np.array([1, 0, 0, 0])
+BASE_LINK_TO_SHOOTER = np.array([0.0, 0.0, 0.0])
 
 @util.cancellableInlineCallbacks
 def run(sub):
+    print_info = text_effects.FprintFactory(title=MISSION).fprint
+    print_bad = text_effects.FprintFactory(title=MISSION, msg_color="red").fprint
+    print_good = text_effects.FprintFactory(title=MISSION, msg_color="green").fprint
+    print_info("STARTING")
 
-    # dive to mission start depth
-    mission_start_depth = float(input("Entered the desired depth for the 'set course' mission: "))  # For pool testing
-    # mission_start_depth = 2.15        # meters
-    print "descending to set course mission depth"
-    sub.to_height(mission_start_depth, 0.5)
+    # Wait for vision services, enable perception
+    print_info("ACTIVATING PERCEPTION SERVICE")
+    yield sub.vision_proxies.torpedo_target.start()
 
-    # Turn on board detection
-    detection_switch = rospy.ServiceProxy('/torpedo_board/detection_activation_switch', TBDetectionSwitch)
-    detection_switch(True)
-    print "Torpedo Board detection activated"
+    pattern = []
+    if DO_PATTERN:
+        start = sub.move.zero_roll_and_pitch()
+        r = SEARCH_RADIUS_METERS
+        pattern = [start.zero_roll_and_pitch(),
+                   start.right(r),
+                   start.up(r),
+                   start.left(r),
+                   start.down(r),
+                   start.right(2 * r),
+                   start.up(2 * r),
+                   start.left(2 * r),
+                   start.down(2 * r)]
+    s = Searcher(sub, sub.vision_proxies.torpedo_target.get_pose, pattern)
+    resp = None
+    print_info("RUNNING SEARCH PATTERN")
+    resp = yield s.start_search(loop=False, timeout=TIMEOUT_SECONDS, spotings_req=1)
 
-    # TODO: Rotate in place so board gets in view
-    print "Executing search pattern"
-    yield sub.move.yaw_left(3.0).zero_roll_and_pitch().go()
+    if resp is None or not resp.found:
+        print_bad("MARKER NOT FOUND")
+        defer.returnValue(None)
 
-    # TODO: once the board moves out of our field of view, stop rotating
-    print "Found torpedo board"
-    torp_pose_sub = rospy.Subscriber("/torpedo_board/pose", Pose, callback=align_to_board, callback_args=sub)
-    rospy.sleep(10)
-    torp_pose_sub.unregister()
+    print_good("PATH MARKER POSE FOUND")
+    assert(resp.pose.header.frame_id == "/map")
 
-    # TODO: move sub to closest point on the ray eminating from the board centroid normal to the board
+    move = sub.move
+    position = rosmsg_to_numpy(resp.pose.pose.position)
+    orientation = rosmsg_to_numpy(resp.pose.pose.orientation)
 
-    # TODO: align x-axis of sub with z axis of torpedo board
-    print "aligning to torpedo board"
+    move = move.set_position(position + BASE_LINK_TO_SHOOTER).set_orientation(orientation).zero_roll_and_pitch()
 
-    # TODO: approach board until it occupies most of our field of view, save
-    # this position as the best obserbation position
-    print "Approaching board"
+    # Ensure SubjuGator continues to face same general direction as before (doesn't go in opposite direction)
+    odom_forward = tf.transformations.quaternion_matrix(sub.move._pose.orientation).dot(forward_vec)
+    marker_forward = tf.transformations.quaternion_matrix(orientation).dot(forward_vec)
+    if FACE_FORWARD and np.sign(odom_forward[0]) != np.sign(marker_forward[0]):
+        move = move.yaw_right(np.pi)
 
-    # TODO: Determine which of the targets has the sliding door covering it
-    print "Examining targets"
-
-    # TODO: While moving in the plane parallel to the board align bottom
-    # paddle to a position on the board slightly to the right of the door
-    # handle
-    print "Aligning to door removal position"
-
-    # TODO: move directly torwards the board until the bottom pattle is aligned with the handle
-    print "Approaching board"
-
-    # TODO: move to the left for about one foot
-    print "Removing target cover"
-
-    # TODO:
+    print_info("MOVING TO MARKER AT {}".format(move._pose.position))
+    yield move.backward(1.5).go(speed=SPEED)
+    print_good("ALIGNED TO PATH MARKER. MOVE FORWARD TO NEXT CHALLENGE!")
+    yield sub.vision_proxies.torpedo_target.stop()
+    defer.returnValue(True)

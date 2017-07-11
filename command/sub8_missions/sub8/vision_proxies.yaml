@@ -8,3 +8,5 @@ buoy:
     root: "/vision/buoys"
 start_gate:
     root: "/vision/start_gate"
+torpedo_target:
+    root: "/vision/torpedo_target"
