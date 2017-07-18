@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-from sub8_vision_tools import StereoVisionNode
+from sub8_vision_tools import VisionNode
 import cv2
 import numpy as np
 import rospy
@@ -9,16 +9,17 @@ from mil_ros_tools import numpy_pair_to_pose, numpy_to_vector3, numpy_to_point, 
 from mil_vision_tools import CircleFinder, Threshold, auto_canny
 from geometry_msgs.msg import Point
 import scipy
-from tf.transformations import quaternion_from_euler
+from tf.transformations import quaternion_from_euler, quaternion_matrix
 from mil_vision_tools import ImageMux
+from sub8_vision_tools import MultiObservation
 
 
 # Ensure opencv3 is used
 assert cv2.__version__[0] == '3'
 
 class Target(object):
-    DIAMETER = 0.3048
-    POSITION_TOLERANCE = 0.2
+    MULTI_OBSERVATION_MODEL = None
+    NEAR_TOLERANCE_PIXELS = 20
     top_idx = 0
     COLORS=np.array([[1.0, 0.0, 0.0, 1.0],
                      [0.0, 1.0, 0.0, 1.0],
@@ -26,48 +27,58 @@ class Target(object):
                      [1.0, 1.0, 0.0, 1.0]], dtype=float)
     NAMES=['RED', 'GREEN', 'BLUE', 'YELLOW']
 
-    def __init__(self, pose=None, time=None, error=None):
+    def __init__(self, points, transform, time):
+        self.last_points = points
+        self.points = np.array([points])
+        self.tfs = [transform]
+        self.times = [time]
         self.id = Target.top_idx
+        if self.id >= 4:
+            self.name = 'UNKNOWN {}'.format(self.id)
+            self.color = [1.0, 1.0, 1.0, 1.0]
+        else:
+            self.name = self.NAMES[self.id]
+            self.color = self.COLORS[self.id]
         Target.top_idx += 1
-        self.pose = pose
-        self.time = time
-        self.error = error
+
+    @classmethod
+    def set_camera_model(cls, model):
+        cls.MULTI_OBSERVATION_MODEL = MultiObservation(model)
+
+    @classmethod
+    def set_params(cls):
+        pass
 
     def get_response(self):
         if self.pose is None:
             return VisionNode.make_response(found=False)
         return VisionNode.make_response(pose=self.pose, frame='/map', stamp=self.time)
 
-    def update_pose(self, pose, error):
-        '''
-        If pose is near current pose, update pose and return True
-        If pose if far from current pose, do nothing and return False
-        '''
-        dist = np.linalg.norm(pose[0] - self.pose[0])
-        print 'DIST', dist
-        if dist < self.POSITION_TOLERANCE:
-            if error <= self.error:
-                self.pose = pose
-                self.error = error
-            return True
-        return False
+    def add_observation(self, points, transform, time):
+        self.last_points = points
+        if np.linalg.norm(transform[0] - self.tfs[-1][0]) > 0.05:
+            self.points = np.vstack((self.points, [points]))
+            self.tfs.append(transform)
+            self.times.append(time)
 
-    def get_marker(self):
-        marker = Marker()
-        marker.header.frame_id  = '/map'
-        marker.ns = 'torpedo_target'
-        marker.type = Marker.ARROW
-        pitch_90 = tf.transformations.euler_matrix(0.0, np.degrees(90), 0.0)[:3, :3]
-        orientation = self.pose[1]
-        marker.pose = numpy_pair_to_pose(self.pose[0], orientation)
-        marker.color = numpy_to_colorRGBA(Target.COLORS[self.id])
-        marker.scale = numpy_to_vector3((0.5, 0.1, 0.1))
-        #marker.scale = numpy_to_vector3(np.array((0.5, 0.5, 0.5)))
-        #marker.scale = numpy_to_vector3(np.array((0.1, self.DIAMETER, self.DIAMETER)))
-        return marker
+    def near(self, centroid):
+        dist = np.linalg.norm(centroid - self.last_points[4])
+        return dist <= self.NEAR_TOLERANCE_PIXELS
+
+    def estimate_pose(self):
+        pts3D = []
+        for i in xrange(self.points.shape[1]-1):
+            pts3D.append(self.MULTI_OBSERVATION_MODEL.lst_sqr_intersection(self.points[:, i, :], self.tfs))
+        position = self.MULTI_OBSERVATION_MODEL.lst_sqr_intersection(self.points[:, -1, :], self.tfs)
+        pts3D = np.array(pts3D)
+        A = np.c_[pts3D[:, 0], pts3D[:, 1], np.ones(pts3D.shape[0])]
+        coeff, resid, _,_ = np.linalg.lstsq(A, pts3D[:, 2])
+        yaw = np.arctan2(coeff[1], coeff[0])
+        quat = quaternion_from_euler(0, 0, yaw)
+        return pts3D, (position, quat)
 
 
-class TorpedoTargetFinder(StereoVisionNode):
+class TorpedoTargetFinder(VisionNode):
     '''
     Node to find the circular targets of the "Battle a Squid" / torpedo task in RoboSub2017.
 
@@ -90,8 +101,7 @@ class TorpedoTargetFinder(StereoVisionNode):
        - ehhhhhhhh, could use
     '''
     def __init__(self):
-        rospy.set_param('~image_topic/left', '/camera/front/left/image_rect_color')
-        rospy.set_param('~image_topic/right', '/camera/front/right/image_rect_color')
+        rospy.set_param('~image_topic', '/camera/front/left/image_rect_color')
         rospy.set_param('~slop', 0.1)
         self.targets = []
         self.canny_low = 30
@@ -99,17 +109,17 @@ class TorpedoTargetFinder(StereoVisionNode):
         self.pose = None
 
         self.tf_listener = tf.TransformListener()
-        self.o = CircleFinder(Target.DIAMETER)
+        self.o = CircleFinder(1.0)
 
-        thresh = {'LAB':[[0,99,139],[255,127,219]]}
+        thresh = {'HSV':[[24,90,60],[70,255,255]]}
         rospy.set_param('~thresh', thresh)
         self.threshold = Threshold.from_param('~thresh')
         super(TorpedoTargetFinder, self).__init__()
-        self.left_dist, self.right_dist, self.left_proj, self.right_proj = self.get_stereo_projection_matricies()
+        Target.set_camera_model(self.cam)
         if self.debug_ros:
             scale = 1.0
-            self.debug_image = ImageMux(size=(scale*self._camera_info_left.height, scale * self._camera_info_right.width), shape=(2, 2), text_color=(0, 0, 255),
-                                        labels=['LEFT FOUND', 'RIGHT FOUND', 'THRESH', 'THRESH'])
+            self.debug_image = ImageMux(size=(scale*self._camera_info.height, scale * self._camera_info.width), shape=(2, 1), text_color=(0, 0, 255),
+                                        labels=['FOUND', 'THRESH'])
 
         self.enabled = True
 
@@ -121,24 +131,9 @@ class TorpedoTargetFinder(StereoVisionNode):
             return self.make_repsonse(found=False)
         return self.targets[0].get_response()
 
-    def get_stereo_projection_matricies(self):
-        try:
-            self.tf_listener.waitForTransform(self.cam_left.tfFrame(), self.cam_right.tfFrame(), rospy.Time(), rospy.Duration(0.5))
-        except tf.Exception as e:
-            print 'TF Exception {}'.format(e)
-            return None
-        tf_trans, tf_quat = self.tf_listener.lookupTransform(self.cam_left.tfFrame(), self.cam_right.tfFrame(), rospy.Time())
-        left_rect, right_rect, left_proj, right_proj, _,_,_ = cv2.stereoRectify(self.cam_left.projectionMatrix()[:3, :3],
-                np.zeros(5), self.cam_right.projectionMatrix()[:3, :3], np.zeros(5),
-          (self._camera_info_left.width, self._camera_info_right.height), np.array([0,0,0]), tf_trans)
-        self.tf_trans = tf_trans
-        return left_rect, right_rect, left_proj, right_proj
-
-    def get_target_corners(self, img, camera):
-        print 'camera'
+    def get_target_corners(self, img):
         blur = cv2.blur(img, (5, 5))
         thresh = self.threshold.threshold(blur)
-        hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
         edges = auto_canny(thresh, 0.8)
         _, contours, hierarchy = cv2.findContours(edges.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         blank = img.copy()#np.zeros(img.shape, dtype=img.dtype)
@@ -148,19 +143,12 @@ class TorpedoTargetFinder(StereoVisionNode):
             if area < 1000:
                 continue
             if self.o.verify_contour(cnt) < 0.4:
-                print 'heir ',idx, hierarchy[0][idx]
                 if hierarchy[0][idx][3] != -1 and hierarchy[0][idx][2] == -1:  # Only get outer edges
                     cv2.drawContours(blank, [cnt], 0, (0, 0, 255), 3)
                     corners = self.o.get_corners(cnt, debug_image=blank)
-                    print 'appending', idx
                     targets.append(corners)
-        if self.debug_ros:
-            if camera == 'left':
-                self.debug_image[0, 0] = blank
-                self.debug_image[1, 0] = thresh
-            if camera=='right':
-                self.debug_image[0, 1] = blank
-                self.debug_image[1, 1] = thresh
+        self.debug_image[0] = blank
+        self.debug_image[1] = thresh
         return targets
 
     def points_marker(self, pts, pose, id=0):
@@ -170,7 +158,7 @@ class TorpedoTargetFinder(StereoVisionNode):
         marker.ns = 'torpedo_points'
         marker.type = Marker.POINTS
         marker.id = id
-        marker.color = numpy_to_colorRGBA(Target.COLORS[id])
+        marker.color = numpy_to_colorRGBA(self.targets[id].color)
         marker.scale.x = 0.05
         marker.scale.y = 0.05
         marker.frame_locked = True
@@ -198,93 +186,9 @@ class TorpedoTargetFinder(StereoVisionNode):
         pts3D = np.subtract(pts3D, centroid)
         A = np.c_[pts3D[:, 0], pts3D[:, 1], np.ones(pts3D.shape[0])]
         coeff, resid, _,_ = np.linalg.lstsq(A, pts3D[:, 2])
-        print 'RESID', resid
         yaw = np.arctan2(coeff[1], coeff[0])
         quat = quaternion_from_euler(0, 0, yaw)
         return (centroid, quat), resid[0]
-
-    def get_3D_points(self, left_pts, right_pts, id=0):
-        print '---'
-        #DBG
-        diff = left_pts - right_pts
-        print 'DIFF ', diff, 'STD', np.std(diff[:, 0])
-
-        # Convert to float points for undistortion
-        left_pts = np.array(left_pts, dtype=float).reshape(4, 1, 2)
-        right_pts = np.array(right_pts, dtype=float).reshape(4, 1, 2)
-
-        # Undistort points for pose estimation
-        left_pts = cv2.undistortPoints(left_pts, self.cam_left.projectionMatrix()[:3, :3], np.zeros(5),
-                                       R=self.left_dist, P=self.left_proj)
-        right_pts = cv2.undistortPoints(right_pts, self.cam_right.projectionMatrix()[:3, :3], np.zeros(5),
-                                        R=self.right_dist, P=self.right_proj)
-
-        # Convert points to their transpose (required for triangulation)
-        left_pts = left_pts.reshape(4, 2).T
-        right_pts = right_pts.reshape(4, 2).T
-
-        #print 'Left:'
-        #print self.cam_left.projectionMatrix()
-        #print self.left_proj
-        #print np.array(self._camera_info_left.R).reshape(3, 3)
-        #print self.left_dist
-        #print 'Right:'
-        #print self.cam_right.projectionMatrix()
-        #print self.right_proj
-        #print np.array(self._camera_info_right.R).reshape(3, 3)
-        #print self.right_dist
-
-        # Triangulate points
-        pts4D = cv2.triangulatePoints(self.left_proj.copy(), self.right_proj.copy(), left_pts.copy(), right_pts.copy())
-        pts3D = cv2.convertPointsFromHomogeneous(pts4D.T)
-        pts3D = -pts3D.reshape(4, 3)
-        pts3D = np.add(pts3D, self.tf_trans)
-        if not self.sane_pose_est(pts3D):
-            return None
-
-        # Transform pose estimate to map frame
-        try:
-            self.tf_listener.waitForTransform('/map', self.cam_left.tfFrame(), self.last_image_time_left,
-                                              rospy.Duration(0.5))
-            tf_trans, tf_quat = self.tf_listener.lookupTransform('/map', self.cam_left.tfFrame(),
-                                                                 self.last_image_time_left)
-            pts3D_map = np.zeros((4, 3), dtype=float)
-            tf_mat = tf.transformations.quaternion_matrix(tf_quat)[:3, :3]
-            for idx, pt in enumerate(pts3D):
-                pts3D_map[idx] = tf_trans + tf_mat.dot(pt)
-            pose, resid = self.get_target_pose(pts3D_map)
-            error = resid
-            #if resid > 1e-7:
-            #    return None
-            return pose, pts3D_map, error
-        except tf.Exception as e:
-            print 'TF Exception {}'.format(e)
-            return None
-
-    def match_contours(self, left_contours, right_contours):
-        '''
-        Attempt to find corosponding target contours in left and right cameras.
-        @param left_contours
-        @param right_contours
-        '''
-        #print 'LEFT={} RIGHT={}'.format(len(left_contours), len(right_contours))
-        matches = []
-        for left_cnt in left_contours:
-            left_M = cv2.moments(left_cnt)
-            centroid_left = np.array([left_M['m10'] / left_M['m00'], left_M['m01'] / left_M['m00']])
-            for right_cnt in right_contours:
-                right_M = cv2.moments(right_cnt)
-                centroid_right = np.array([right_M['m10'] / right_M['m00'], right_M['m01'] / right_M['m00']])
-                r_diff = abs(np.linalg.norm(centroid_left - left_cnt[0]) - np.linalg.norm(centroid_right - right_cnt[0]))
-                print r_diff
-                if abs(centroid_left[1] - centroid_right[1]) < 10 and r_diff < 1.0:
-                    matched = True
-                    #for m in matches:
-                    #    if np.linalg.norm(m[0] - left_cnt) < 20 or np.linalg.norm(m[1] - right_cnt) < 20:
-                    #        matched = False
-                    if matched:
-                        matches.append([left_cnt, right_cnt])
-        return matches
 
     def sane_pose_est(self, points3d):
         z = np.mean(points3d[:, 2])
@@ -299,29 +203,34 @@ class TorpedoTargetFinder(StereoVisionNode):
                 return False
         return True
 
-    def img_cb(self, left, right):
-        left_targets = self.get_target_corners(left, 'left')
-        right_targets = self.get_target_corners(right, 'right')
-        matches = self.match_contours(left_targets, right_targets)
-        print 'matches ', len(matches)
-        #print 'Left Targets={}, Right Targets={}, Matches={}'.format(len(left_targets), len(right_targets), len(matches))
-        #print '{} MATCHES'.format(len(matches))
-        for i, m in enumerate(matches):
-            #print 'getting 3d points'
-            ret = self.get_3D_points(m[0], m[1], id=i)
-            if ret is not None:
-                pose, pts3D, error = ret
-                found = False
-                for idx in xrange(len(self.targets)):
-                    if self.targets[idx].update_pose(pose, error):
-                        t_id = self.targets[idx].id
-                        found = True
-                        break
-                if not found:
-                    self.targets.append(Target(pose, rospy.Time.now(), error))
-                    t_id = self.targets[-1].id
-                print 'ID', Target.NAMES[t_id]
-                self.points_marker(pts3D, pose, id=t_id)
+    def add_target(self, target, transform, time):
+        M = cv2.moments(target)
+        centroid = (int(M['m10'] / M['m00']), int(M['m01'] / M['m00']))
+        target = np.vstack((target, centroid))
+        for idx in xrange(len(self.targets)):
+            if self.targets[idx].near(target[-1]):
+                self.targets[idx].add_observation(target, transform, time)
+                if len(self.targets[idx].points) > 10:
+                    points, pose = self.targets[idx].estimate_pose()
+                    self.points_marker(points, pose, idx)
+                return
+        if len(self.targets) >= 4:
+            print 'too many'
+            return
+        self.targets.append(Target(target, transform, time))
+
+    def img_cb(self, img):
+        try:
+            self.tf_listener.waitForTransform('/map', self.cam.tfFrame(), self.last_image_time, rospy.Duration(0.2))
+            tf_trans, tf_quat = self.tf_listener.lookupTransform('/map', self.cam.tfFrame(), self.last_image_time)
+            tf_rot = quaternion_matrix(tf_quat)[:3, :3]
+            tf_cam_map = (np.array(tf_trans), np.array(tf_rot))
+        except tf.Exception as e:
+            rospy.logwarn('TF error {}'.format(e))
+            return
+        targets = self.get_target_corners(img)
+        for target in targets:
+            self.add_target(target, tf_cam_map, self.last_image_time)
         self.send_debug_image(self.debug_image.image)
 
 if __name__ == '__main__':
