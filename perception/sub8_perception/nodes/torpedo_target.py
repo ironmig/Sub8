@@ -92,6 +92,7 @@ class TorpedoTargetFinder(StereoVisionNode):
     def __init__(self):
         rospy.set_param('~image_topic/left', '/camera/front/left/image_rect_color')
         rospy.set_param('~image_topic/right', '/camera/front/right/image_rect_color')
+        rospy.set_param('~slop', 0.1)
         self.targets = []
         self.canny_low = 30
         self.canny_ratio = 1.0
@@ -100,13 +101,14 @@ class TorpedoTargetFinder(StereoVisionNode):
         self.tf_listener = tf.TransformListener()
         self.o = CircleFinder(Target.DIAMETER)
 
-        thresh = {'HSV':[[20,0,0],[38,255,255]]}
+        thresh = {'LAB':[[0,99,139],[255,127,219]]}
         rospy.set_param('~thresh', thresh)
         self.threshold = Threshold.from_param('~thresh')
         super(TorpedoTargetFinder, self).__init__()
         self.left_dist, self.right_dist, self.left_proj, self.right_proj = self.get_stereo_projection_matricies()
         if self.debug_ros:
-            self.debug_image = ImageMux(size=(640, 480), shape=(2, 2), text_color=(0, 0, 255),
+            scale = 1.0
+            self.debug_image = ImageMux(size=(scale*self._camera_info_left.height, scale * self._camera_info_right.width), shape=(2, 2), text_color=(0, 0, 255),
                                         labels=['LEFT FOUND', 'RIGHT FOUND', 'THRESH', 'THRESH'])
 
         self.enabled = True
@@ -126,28 +128,32 @@ class TorpedoTargetFinder(StereoVisionNode):
             print 'TF Exception {}'.format(e)
             return None
         tf_trans, tf_quat = self.tf_listener.lookupTransform(self.cam_left.tfFrame(), self.cam_right.tfFrame(), rospy.Time())
-        left_rect, right_rect, left_proj, right_proj, _,_,_ = cv2.stereoRectify(self.cam_left.intrinsicMatrix(),
-          self.cam_left.distortionCoeffs(), self.cam_right.intrinsicMatrix(), self.cam_right.distortionCoeffs(),
+        left_rect, right_rect, left_proj, right_proj, _,_,_ = cv2.stereoRectify(self.cam_left.projectionMatrix()[:3, :3],
+                np.zeros(5), self.cam_right.projectionMatrix()[:3, :3], np.zeros(5),
           (self._camera_info_left.width, self._camera_info_right.height), np.array([0,0,0]), tf_trans)
         self.tf_trans = tf_trans
         return left_rect, right_rect, left_proj, right_proj
 
     def get_target_corners(self, img, camera):
+        print 'camera'
         blur = cv2.blur(img, (5, 5))
         thresh = self.threshold.threshold(blur)
         hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
         edges = auto_canny(thresh, 0.8)
-        _, contours, _ = cv2.findContours(edges.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        blank = np.zeros(img.shape, dtype=img.dtype)
+        _, contours, hierarchy = cv2.findContours(edges.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        blank = img.copy()#np.zeros(img.shape, dtype=img.dtype)
         targets = []
-        for cnt in contours:
+        for idx, cnt in enumerate(contours):
             area = cv2.contourArea(cnt)
             if area < 1000:
                 continue
             if self.o.verify_contour(cnt) < 0.4:
-                cv2.drawContours(blank, [cnt], 0, (0, 0, 255), 3)
-                corners = self.o.get_corners(cnt, debug_image=blank)
-                targets.append(corners)
+                print 'heir ',idx, hierarchy[0][idx]
+                if hierarchy[0][idx][3] != -1 and hierarchy[0][idx][2] == -1:  # Only get outer edges
+                    cv2.drawContours(blank, [cnt], 0, (0, 0, 255), 3)
+                    corners = self.o.get_corners(cnt, debug_image=blank)
+                    print 'appending', idx
+                    targets.append(corners)
         if self.debug_ros:
             if camera == 'left':
                 self.debug_image[0, 0] = blank
@@ -208,14 +214,25 @@ class TorpedoTargetFinder(StereoVisionNode):
         right_pts = np.array(right_pts, dtype=float).reshape(4, 1, 2)
 
         # Undistort points for pose estimation
-        left_pts = cv2.undistortPoints(left_pts, self.cam_left.intrinsicMatrix(), self.cam_left.distortionCoeffs(),
+        left_pts = cv2.undistortPoints(left_pts, self.cam_left.projectionMatrix()[:3, :3], np.zeros(5),
                                        R=self.left_dist, P=self.left_proj)
-        right_pts = cv2.undistortPoints(right_pts, self.cam_right.intrinsicMatrix(), self.cam_right.distortionCoeffs(),
+        right_pts = cv2.undistortPoints(right_pts, self.cam_right.projectionMatrix()[:3, :3], np.zeros(5),
                                         R=self.right_dist, P=self.right_proj)
 
         # Convert points to their transpose (required for triangulation)
         left_pts = left_pts.reshape(4, 2).T
         right_pts = right_pts.reshape(4, 2).T
+
+        #print 'Left:'
+        #print self.cam_left.projectionMatrix()
+        #print self.left_proj
+        #print np.array(self._camera_info_left.R).reshape(3, 3)
+        #print self.left_dist
+        #print 'Right:'
+        #print self.cam_right.projectionMatrix()
+        #print self.right_proj
+        #print np.array(self._camera_info_right.R).reshape(3, 3)
+        #print self.right_dist
 
         # Triangulate points
         pts4D = cv2.triangulatePoints(self.left_proj.copy(), self.right_proj.copy(), left_pts.copy(), right_pts.copy())
@@ -258,23 +275,27 @@ class TorpedoTargetFinder(StereoVisionNode):
             for right_cnt in right_contours:
                 right_M = cv2.moments(right_cnt)
                 centroid_right = np.array([right_M['m10'] / right_M['m00'], right_M['m01'] / right_M['m00']])
-                if abs(centroid_left[1] - centroid_right[1]) < 5:
+                r_diff = abs(np.linalg.norm(centroid_left - left_cnt[0]) - np.linalg.norm(centroid_right - right_cnt[0]))
+                print r_diff
+                if abs(centroid_left[1] - centroid_right[1]) < 10 and r_diff < 1.0:
                     matched = True
-                    for m in matches:
-                        if np.linalg.norm(m[0] - left_cnt) < 20 or np.linalg.norm(m[1] - right_cnt) < 20:
-                            matched = False
+                    #for m in matches:
+                    #    if np.linalg.norm(m[0] - left_cnt) < 20 or np.linalg.norm(m[1] - right_cnt) < 20:
+                    #        matched = False
                     if matched:
                         matches.append([left_cnt, right_cnt])
         return matches
 
     def sane_pose_est(self, points3d):
+        z = np.mean(points3d[:, 2])
+        #return z > 1.0
         distances = [np.linalg.norm(points3d[3] - points3d[2]),
                      np.linalg.norm(points3d[2] - points3d[1]),
                      np.linalg.norm(points3d[1] - points3d[0]),
                      np.linalg.norm(points3d[3] - points3d[0])]
         for d in distances:
-            if (d < 0.26 or d > 0.5):
-                print 'insane in the membrane',d
+            if (d < 0.1 or d > 0.65):
+                print 'insane in the membrane',d, np.mean(points3d[:, 2])
                 return False
         return True
 
@@ -282,6 +303,7 @@ class TorpedoTargetFinder(StereoVisionNode):
         left_targets = self.get_target_corners(left, 'left')
         right_targets = self.get_target_corners(right, 'right')
         matches = self.match_contours(left_targets, right_targets)
+        print 'matches ', len(matches)
         #print 'Left Targets={}, Right Targets={}, Matches={}'.format(len(left_targets), len(right_targets), len(matches))
         #print '{} MATCHES'.format(len(matches))
         for i, m in enumerate(matches):
