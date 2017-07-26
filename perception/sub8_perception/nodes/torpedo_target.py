@@ -44,7 +44,7 @@ class Target(object):
         If pose if far from current pose, do nothing and return False
         '''
         dist = np.linalg.norm(pose[0] - self.pose[0])
-        print 'DIST', dist
+        #print 'DIST', dist
         if dist < self.POSITION_TOLERANCE:
             if error <= self.error:
                 self.pose = pose
@@ -101,7 +101,7 @@ class TorpedoTargetFinder(StereoVisionNode):
         self.tf_listener = tf.TransformListener()
         self.o = CircleFinder(Target.DIAMETER)
 
-        thresh = {'LAB':[[0,99,139],[255,127,219]]}
+        thresh = {'LAB':[[0,95,130],[255,127,219]]}
         rospy.set_param('~thresh', thresh)
         self.threshold = Threshold.from_param('~thresh')
         super(TorpedoTargetFinder, self).__init__()
@@ -135,7 +135,7 @@ class TorpedoTargetFinder(StereoVisionNode):
         return left_rect, right_rect, left_proj, right_proj
 
     def get_target_corners(self, img, camera):
-        print 'camera'
+        #print 'camera'
         blur = cv2.blur(img, (5, 5))
         thresh = self.threshold.threshold(blur)
         hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
@@ -145,15 +145,29 @@ class TorpedoTargetFinder(StereoVisionNode):
         targets = []
         for idx, cnt in enumerate(contours):
             area = cv2.contourArea(cnt)
-            if area < 1000:
+            if area < 700:
+                #print 'too small', area
                 continue
+            circle_test = self.o.verify_contour(cnt)
             if self.o.verify_contour(cnt) < 0.4:
-                print 'heir ',idx, hierarchy[0][idx]
+                #print 'heir ',idx, hierarchy[0][idx]
                 if hierarchy[0][idx][3] != -1 and hierarchy[0][idx][2] == -1:  # Only get outer edges
                     cv2.drawContours(blank, [cnt], 0, (0, 0, 255), 3)
-                    corners = self.o.get_corners(cnt, debug_image=blank)
-                    print 'appending', idx
+                    x, y, w, h = cv2.boundingRect(cnt)
+                    corners = np.array([[x, y],
+                                        [x + w, y],
+                                        [x + w, y + h],
+                                        [x, y + h]])
+                    #corners = self.o.get_corners(cnt, debug_image=blank)
+                    #print 'corners', corners
+                    for pt in corners:
+                        cv2.circle(blank, (pt[0], pt[1]), 5, (0, 255, 0), -1)
+                    M = cv2.moments(cnt)
+                    corners = np.vstack((corners, [M['m10'] / M['m00'], M['m01'] / M['m00']]))
+                    cv2.circle(blank, (int(corners[-1][0]), int(corners[-1][1])), 5, (0, 255, 255), -1)
                     targets.append(corners)
+            else:
+                print 'failed cirlce with', circle_test
         if self.debug_ros:
             if camera == 'left':
                 self.debug_image[0, 0] = blank
@@ -198,16 +212,16 @@ class TorpedoTargetFinder(StereoVisionNode):
         pts3D = np.subtract(pts3D, centroid)
         A = np.c_[pts3D[:, 0], pts3D[:, 1], np.ones(pts3D.shape[0])]
         coeff, resid, _,_ = np.linalg.lstsq(A, pts3D[:, 2])
-        print 'RESID', resid
+        #print 'RESID', resid
         yaw = np.arctan2(coeff[1], coeff[0])
         quat = quaternion_from_euler(0, 0, yaw)
         return (centroid, quat), resid[0]
 
     def get_3D_points(self, left_pts, right_pts, id=0):
-        print '---'
+        #print '---'
         #DBG
         diff = left_pts - right_pts
-        print 'DIFF ', diff, 'STD', np.std(diff[:, 0])
+        #print 'DIFF ', diff, 'STD', np.std(diff[:, 0])
 
         # Convert to float points for undistortion
         left_pts = np.array(left_pts, dtype=float).reshape(4, 1, 2)
@@ -270,20 +284,53 @@ class TorpedoTargetFinder(StereoVisionNode):
         #print 'LEFT={} RIGHT={}'.format(len(left_contours), len(right_contours))
         matches = []
         for left_cnt in left_contours:
-            left_M = cv2.moments(left_cnt)
-            centroid_left = np.array([left_M['m10'] / left_M['m00'], left_M['m01'] / left_M['m00']])
             for right_cnt in right_contours:
-                right_M = cv2.moments(right_cnt)
-                centroid_right = np.array([right_M['m10'] / right_M['m00'], right_M['m01'] / right_M['m00']])
-                r_diff = abs(np.linalg.norm(centroid_left - left_cnt[0]) - np.linalg.norm(centroid_right - right_cnt[0]))
-                print r_diff
-                if abs(centroid_left[1] - centroid_right[1]) < 10 and r_diff < 1.0:
+                r_diff = abs(np.linalg.norm(left_cnt[-1] - left_cnt[0]) - np.linalg.norm(right_cnt[-1] - right_cnt[0]))
+                y_diff = abs(left_cnt[-1][1] - right_cnt[-1][1])
+                print 'r_diff', r_diff, 'y_diff', y_diff
+                #print r_diff
+                if y_diff < 100 and r_diff < 5.0:
                     matched = True
                     #for m in matches:
                     #    if np.linalg.norm(m[0] - left_cnt) < 20 or np.linalg.norm(m[1] - right_cnt) < 20:
                     #        matched = False
                     if matched:
                         matches.append([left_cnt, right_cnt])
+        return matches
+
+    def get_context_dict(self, targets):
+        ret = {}
+        if len(targets) < 2 or len(targets) > 4:
+            return ret
+        sorted_x = sorted(targets, key=lambda target: target[-1][0])
+        if abs(sorted_x[0][-1][0] - sorted_x[1][-1][0]) < 50:
+            board_one_sorted_y = sorted(sorted_x[0:2], key=lambda target: target[-1][1])
+            if np.linalg.norm(board_one_sorted_y[0][-1] - board_one_sorted_y[0][0]) < np.linalg.norm(board_one_sorted_y[1][-1] - board_one_sorted_y[1][0]):
+               ret['TENTACLE_SMALL'] = board_one_sorted_y[0]
+               ret['TENTACLE_LARGE'] = board_one_sorted_y[1]
+            else:
+                ret['SQUID_LARGE'] = board_one_sorted_y[0]
+                ret['SQUID_SMALL'] = board_one_sorted_y[1]
+        if len(targets) == 4 and abs(sorted_x[2][-1][0] - sorted_x[3][-1][0]):
+            board_two_sorted_y = sorted(sorted_x[2:], key=lambda target: target[-1][1])
+            if np.linalg.norm(board_two_sorted_y[0][-1] - board_two_sorted_y[0][0]) < np.linalg.norm(board_two_sorted_y[1][-1] - board_two_sorted_y[1][0]) and 'TENTACLE_LARGE' not in ret:
+               ret['TENTACLE_SMALL'] = board_two_sorted_y[0]
+               ret['TENTACLE_LARGE'] = board_two_sorted_y[1]
+            elif 'SQUID_LARGE' not in ret:
+                ret['SQUID_LARGE'] = board_two_sorted_y[0]
+                ret['SQUID_SMALL'] = board_two_sorted_y[1]
+        return ret
+
+
+    def match_contours_context_aware(self, left_targets, right_targets):
+        left_dict = self.get_context_dict(left_targets)
+        right_dict = self.get_context_dict(right_targets)
+        matches = []
+        for key in left_dict:
+            if key in right_dict:
+                matches.append([left_dict[key], right_dict[key]])
+        print 'left', left_dict
+        print 'right', right_dict
         return matches
 
     def sane_pose_est(self, points3d):
@@ -299,11 +346,22 @@ class TorpedoTargetFinder(StereoVisionNode):
                 return False
         return True
 
+    def draw_matches(self, image, matches):
+        for match in matches:
+            pt1 = (int(match[0][-1][0]) / 2, int(match[0][-1][1]) / 2)
+            pt2 = (int(match[1][-1][0] / 2 + image.shape[1] / 2), int(match[1][-1][1]) / 2)
+            cv2.line(image, pt1, pt2 , (0, 255, 255))
+        return image
+
     def img_cb(self, left, right):
         left_targets = self.get_target_corners(left, 'left')
         right_targets = self.get_target_corners(right, 'right')
-        matches = self.match_contours(left_targets, right_targets)
+        debug_img = self.debug_image.image
+        matches = self.match_contours_context_aware(left_targets, right_targets)
+        debug_img = self.draw_matches(debug_img, matches)
         print 'matches ', len(matches)
+        self.send_debug_image(debug_img)
+        return
         #print 'Left Targets={}, Right Targets={}, Matches={}'.format(len(left_targets), len(right_targets), len(matches))
         #print '{} MATCHES'.format(len(matches))
         for i, m in enumerate(matches):
@@ -320,9 +378,8 @@ class TorpedoTargetFinder(StereoVisionNode):
                 if not found:
                     self.targets.append(Target(pose, rospy.Time.now(), error))
                     t_id = self.targets[-1].id
-                print 'ID', Target.NAMES[t_id]
+                #print 'ID', Target.NAMES[t_id]
                 self.points_marker(pts3D, pose, id=t_id)
-        self.send_debug_image(self.debug_image.image)
 
 if __name__ == '__main__':
     rospy.init_node('torpedo_target')
